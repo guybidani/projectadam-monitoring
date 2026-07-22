@@ -1,0 +1,4 @@
+# Shell scripts and workflows must stay LF so bash on Linux runners doesn't choke on \r
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
