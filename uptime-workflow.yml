@@ -1,0 +1,39 @@
+name: uptime-monitor
+
+on:
+  schedule:
+    # every 5 minutes — GitHub may delay under load; this is the min allowed interval
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      selftest:
+        description: 'Self-test: send one marked test alert email to verify the pipe'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write          # open/close outage issues (dedup state)
+
+concurrency:
+  group: uptime-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run uptime checks
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ inputs.selftest }}" = "true" ]; then
+            bash check.sh selftest
+          else
+            bash check.sh
+          fi
