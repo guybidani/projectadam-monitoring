@@ -24,6 +24,26 @@ TARGETS=(
   "Kolio|https://kolio.projectadam.co.il/api/health|health"
 )
 
+# --- deploy-drift check -----------------------------------------------------
+# Does the commit each app SERVES at /health match its repo HEAD? The /health
+# "commit" field is process.env.SOURCE_COMMIT — Coolify injects the deployed git
+# SHA as a runtime env on every deploy, so it reflects what is ACTUALLY running
+# (= the image tag), not the source tree. A green /health does NOT prove a deploy
+# landed (two swaps silently failed on 2026-07-22); this catches that.
+# Alert only when a drift persists past DRIFT_MAX_AGE_MIN — a normal deploy lags
+# a few minutes; a stuck/failed swap lingers. Needs REPO_HEAD_TOKEN (read-only
+# PAT, contents:read) to read private-repo HEADs; unset -> whole check is a no-op.
+# Per app: a missing / "unknown" commit = not yet instrumented -> skipped (safe
+# rollout — each product lights up once it ships the /health commit field).
+# name | health_url | repo | branch
+DRIFT_TARGETS=(
+  "Vixy|https://vixy.projectadam.co.il/api/health|guybidani/vixy|main"
+  "Vixy CRM|https://crm.projectadam.co.il/health|guybidani/vixy-crm|master"
+  "Kolio|https://kolio.projectadam.co.il/api/health|guybidani/kolio|master"
+  "Project Adam|https://projectadam.co.il/api/health|guybidani/project-adam-website|main"
+)
+DRIFT_MAX_AGE_MIN="${DRIFT_MAX_AGE_MIN:-60}"
+
 BODY_FILE="$(mktemp)"
 trap 'rm -f "$BODY_FILE"' EXIT
 
@@ -88,6 +108,60 @@ find_issue() {
     --jq "map(select(.title==\"🔴 OUTAGE: $1\")) | .[0].number // empty" 2>/dev/null
 }
 
+# --- drift helpers ---------------------------------------------------------
+# the commit an app serves at /health (empty if absent / "unknown" / not JSON)
+running_commit() {
+  curl -sS --max-time 20 "$1" 2>/dev/null | python3 -c 'import sys,json
+try:
+  c=(json.load(sys.stdin).get("commit") or "").strip()
+  print("" if c in ("","unknown") else c)
+except Exception:
+  print("")'
+}
+# HEAD sha of repo@branch via the GitHub API (empty on any error)
+head_commit() {
+  curl -sS --max-time 20 \
+    -H "Authorization: Bearer $REPO_HEAD_TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/repos/$1/commits/$2" 2>/dev/null | python3 -c 'import sys,json
+try: print((json.load(sys.stdin).get("sha") or "").strip())
+except Exception: print("")'
+}
+# commits are equal if the shorter (>=7 chars) is a prefix of the longer.
+# Apps report SOURCE_COMMIT at different abbreviations (Vixy full 40-char, CRM
+# 7-char); the GitHub API returns the full 40-char sha. Prefix match keeps the
+# monitor correct no matter how each app truncates its commit field.
+commits_match() {
+  local a="$1" b="$2" short long
+  { [ -z "$a" ] || [ -z "$b" ]; } && return 1
+  if [ "${#a}" -le "${#b}" ]; then short="$a"; long="$b"; else short="$b"; long="$a"; fi
+  [ "${#short}" -ge 7 ] || return 1
+  case "$long" in "$short"*) return 0 ;; *) return 1 ;; esac
+}
+# open drift issue number for a target (empty if none)
+find_drift_issue() {
+  gh issue list --repo "$REPO" --state open --label drift --json number,title \
+    --jq "map(select(.title==\"🟡 DRIFT: $1\")) | .[0].number // empty" 2>/dev/null
+}
+# minutes since an issue was created (0 if unknown)
+issue_age_min() {
+  local created
+  created=$(gh issue view "$1" --repo "$REPO" --json createdAt --jq .createdAt 2>/dev/null)
+  [ -z "$created" ] && { echo 0; return; }
+  python3 -c 'import sys,datetime
+try:
+  c=datetime.datetime.fromisoformat(sys.argv[1].replace("Z","+00:00"))
+  print(int((datetime.datetime.now(datetime.timezone.utc)-c).total_seconds()//60))
+except Exception:
+  print(0)' "$created"
+}
+# has this issue already been emailed about?
+issue_has_alerted() {
+  gh issue view "$1" --repo "$REPO" --json labels \
+    --jq 'any(.labels[]; .name=="drift-alerted")' 2>/dev/null | grep -q true
+}
+
 # --- self-test: prove the alert pipe reaches Guy ---------------------------
 if [ "${1:-}" = "selftest" ]; then
   log "=== SELF-TEST ==="
@@ -148,6 +222,66 @@ for entry in "${TARGETS[@]}"; do
     fi
   fi
 done
+
+# --- deploy-drift loop (deployed commit vs repo HEAD) ----------------------
+# Guarded: with no token to read private-repo HEADs, skip entirely (no-op) so
+# the workflow is merge-safe before the secret exists.
+if [ -n "${REPO_HEAD_TOKEN:-}" ]; then
+  gh label create drift         --repo "$REPO" --color FBCA04 --description "deployed commit != repo HEAD" >/dev/null 2>&1 || true
+  gh label create drift-alerted --repo "$REPO" --color D93F0B --description "drift alert already emailed"   >/dev/null 2>&1 || true
+  summ "\n### Deploy drift — $(date -u +'%Y-%m-%d %H:%M UTC')\n\n| Product | Deployed | HEAD | State |\n|---|---|---|---|"
+
+  for entry in "${DRIFT_TARGETS[@]}"; do
+    IFS='|' read -r name url repo branch <<< "$entry"
+    ts=$(date -u +"%Y-%m-%d %H:%M UTC")
+    dep=$(running_commit "$url")
+    headsha=$(head_commit "$repo" "$branch")
+    dissue=$(find_drift_issue "$name")
+
+    if [ -z "$dep" ]; then
+      log "➖ drift $name — /health reports no commit yet (skip)"
+      summ "| $name | _n/a_ | ${headsha:0:7} | ➖ not instrumented |"
+      continue
+    fi
+    if [ -z "$headsha" ]; then
+      log "➖ drift $name — could not read HEAD of $repo@$branch (skip)"
+      summ "| $name | ${dep:0:7} | _err_ | ➖ HEAD unreadable |"
+      continue
+    fi
+
+    if commits_match "$dep" "$headsha"; then
+      log "✅ drift $name — in sync (${dep:0:7})"
+      summ "| $name | ${dep:0:7} | ${headsha:0:7} | ✅ in sync |"
+      if [ -n "$dissue" ]; then
+        gh issue close "$dissue" --repo "$REPO" \
+          --comment "Realigned at $ts — deployed ${dep:0:12} == HEAD." >/dev/null 2>&1 || true
+      fi
+    else
+      log "⚠️  drift $name — deployed ${dep:0:7} != HEAD ${headsha:0:7}"
+      summ "| $name | ${dep:0:7} | ${headsha:0:7} | ⚠️ DRIFT |"
+      if [ -z "$dissue" ]; then
+        # first detection -> record state, do NOT alert yet (grace window)
+        gh issue create --repo "$REPO" --label drift \
+          --title "🟡 DRIFT: $name" \
+          --body "$(printf 'Deploy drift first seen at %s\nDeployed (running): %s\nHEAD (%s@%s): %s\nHealth: %s\n\n_Alerts only if this persists > %s min (normal deploys lag a few minutes). Auto-closes on realignment._' "$ts" "$dep" "$repo" "$branch" "$headsha" "$url" "$DRIFT_MAX_AGE_MIN")" \
+          >/dev/null 2>&1 || log "   ⚠️  could not create drift issue"
+        log "   (drift recorded — ${DRIFT_MAX_AGE_MIN}m grace window before alert)"
+      else
+        age=$(issue_age_min "$dissue")
+        if [ "$age" -ge "$DRIFT_MAX_AGE_MIN" ] && ! issue_has_alerted "$dissue"; then
+          gh issue edit "$dissue" --repo "$REPO" --add-label drift-alerted >/dev/null 2>&1 || true
+          send_email "🟡 סחף פריסה: $name לא מעודכן" \
+            "<div dir=rtl style='font-family:Arial'><h2 style='color:#b8860b'>🟡 $name — הקוד שרץ אינו העדכני</h2>
+             <p>הקומיט שרץ בפרודקשן שונה מ-HEAD כבר מעל $DRIFT_MAX_AGE_MIN דקות — כנראה פריסה שנתקעה או נכשלה.</p>
+             <p><b>זמן:</b> $ts<br><b>רץ בפועל:</b> ${dep:0:12}<br><b>HEAD ($branch):</b> ${headsha:0:12}<br><b>מקור:</b> $repo</p>
+             <p>בדוק את הפריסה האחרונה ב-Coolify. הודעה זו נשלחת פעם אחת עד ליישור מחדש.</p></div>"
+        else
+          log "   (drift issue #$dissue open, age ${age}m — $( [ "$age" -ge "$DRIFT_MAX_AGE_MIN" ] && echo already-alerted || echo within-grace ))"
+        fi
+      fi
+    fi
+  done
+fi
 
 if [ "$FAILED" -ne 0 ]; then
   log ""

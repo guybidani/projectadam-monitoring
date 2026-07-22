@@ -30,7 +30,11 @@ jobs:
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           ALERT_TO: ${{ secrets.ALERT_TO }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}          # issues on THIS repo (dedup state)
+          # Read-only PAT (contents:read on the 4 product repos) for the deploy-drift
+          # check to read each repo's HEAD. Optional: if the secret is unset the
+          # drift check is skipped and only uptime runs. Never put a token in code.
+          REPO_HEAD_TOKEN: ${{ secrets.REPO_HEAD_TOKEN }}
         run: |
           if [ "${{ inputs.selftest }}" = "true" ]; then
             bash check.sh selftest
