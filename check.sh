@@ -32,14 +32,17 @@ summ() { [ -n "${GITHUB_STEP_SUMMARY:-}" ] && echo -e "$1" >> "$GITHUB_STEP_SUMM
 
 # --- email via Resend -------------------------------------------------------
 send_email() {
-  local subject="$1" html="$2" resp
+  local subject="$1" html="$2" resp payload
+  # Build the JSON with python3 (present on GitHub runners; correct escaping for
+  # Hebrew/quotes/newlines). Values passed via env, never interpolated -> no injection.
+  payload=$(SUBJECT="$subject" HTML="$html" MFROM="$FROM" MTO="$ALERT_TO" python3 -c 'import json,os
+print(json.dumps({"from":os.environ["MFROM"],"to":[os.environ["MTO"]],"subject":os.environ["SUBJECT"],"html":os.environ["HTML"]}))')
   resp=$(curl -sS -X POST https://api.resend.com/emails \
     -H "Authorization: Bearer $RESEND_API_KEY" \
     -H "Content-Type: application/json" \
-    -d "$(jq -n --arg from "$FROM" --arg to "$ALERT_TO" --arg s "$subject" --arg h "$html" \
-        '{from:$from,to:[$to],subject:$s,html:$h}')")
+    -d "$payload")
   if echo "$resp" | grep -q '"id"'; then
-    log "   ✉️  email sent: $(echo "$resp" | jq -r .id 2>/dev/null)"
+    log "   ✉️  email sent: $(echo "$resp" | sed -E 's/.*"id":"([^"]+)".*/\1/')"
     return 0
   fi
   log "   ⚠️  email FAILED: $resp"
