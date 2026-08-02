@@ -12,16 +12,20 @@ set -uo pipefail
 REPO="${GITHUB_REPOSITORY:-guybidani/projectadam-monitoring}"
 ALERT_TO="${ALERT_TO:?ALERT_TO not set}"
 RESEND_API_KEY="${RESEND_API_KEY:?RESEND_API_KEY not set}"
-FROM="Project Adam Monitor <noreply@projectadam.co.il>"
+# vixy.co.il is the Resend-verified sender domain (projectadam.co.il lost
+# verification in the 29.7 rebrand — alerts from it were silently rejected).
+FROM="Vixy Monitor <noreply@vixy.co.il>"
 RETRIES=3
 RETRY_WAIT=15
 
 # name | url | type(health|page)
+# vixy.co.il domains are what customers use since the 29.7 rebrand; the old
+# *.projectadam.co.il subdomains are only an OAuth safety net — not monitored.
 TARGETS=(
   "Project Adam|https://projectadam.co.il/|page"
-  "Vixy|https://vixy.projectadam.co.il/api/health|health"
-  "Vixy CRM|https://crm.projectadam.co.il/health|health"
-  "Kolio|https://kolio.projectadam.co.il/api/health|health"
+  "Vixy Ads|https://vixy.co.il/api/health|health"
+  "Vixy CRM|https://crm.vixy.co.il/health|health"
+  "Vixy Coach|https://coach.vixy.co.il/api/health|health"
 )
 
 # --- deploy-drift check -----------------------------------------------------
@@ -37,9 +41,9 @@ TARGETS=(
 # rollout — each product lights up once it ships the /health commit field).
 # name | health_url | repo | branch
 DRIFT_TARGETS=(
-  "Vixy|https://vixy.projectadam.co.il/api/health|guybidani/vixy|main"
-  "Vixy CRM|https://crm.projectadam.co.il/health|guybidani/vixy-crm|master"
-  "Kolio|https://kolio.projectadam.co.il/api/health|guybidani/kolio|master"
+  "Vixy Ads|https://vixy.co.il/api/health|guybidani/vixy|master"
+  "Vixy CRM|https://crm.vixy.co.il/health|guybidani/vixy-crm|master"
+  "Vixy Coach|https://coach.vixy.co.il/api/health|guybidani/kolio|master"
   "Project Adam|https://projectadam.co.il/api/health|guybidani/project-adam-website|main"
 )
 DRIFT_MAX_AGE_MIN="${DRIFT_MAX_AGE_MIN:-60}"
@@ -173,7 +177,7 @@ if [ "${1:-}" = "selftest" ]; then
   send_email "✅ [בדיקת מערכת] ניטור Project Adam הופעל" \
     "<div dir=rtl style='font-family:Arial'><h2>✅ מערכת הניטור פעילה</h2>
      <p>זו הודעת בדיקה חד-פעמית שמאשרת שהתראות הניטור מגיעות אליך.</p>
-     <p>מהיום, 4 המוצרים (Project Adam, Vixy, Vixy CRM, Kolio) נבדקים כל 5 דקות מ-GitHub (מחוץ לשרת).
+     <p>מהיום, 4 המוצרים (Project Adam, Vixy Ads, Vixy CRM, Vixy Coach) נבדקים על דומייני vixy.co.il החיים כל 5 דקות מ-GitHub (מחוץ לשרת).
      תקבל מייל רק אם משהו נופל באמת (אחרי 3 בדיקות רצופות), ומייל נוסף כשהוא חוזר.</p>
      <p style='color:#888'>זמן: $ts · אפשר להתעלם מהודעה זו.</p></div>"
   log "=== SELF-TEST DONE ==="
