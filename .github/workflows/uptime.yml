@@ -22,7 +22,10 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # A real multi-product outage needs ~90s per DOWN target (3 probes + waits +
+    # alert + issue). The old 5-min timeout killed the 5.8 outage run mid-flight:
+    # alerts went out but issues/recovery never happened. 58 covers the loop below.
+    timeout-minutes: 58
     steps:
       - uses: actions/checkout@v4
 
@@ -39,5 +42,14 @@ jobs:
           if [ "${{ inputs.selftest }}" = "true" ]; then
             bash check.sh selftest
           else
-            bash check.sh
+            # GitHub throttles */5 schedules hard (measured 5.8: runs started
+            # ~2h apart). So each run probes every ~5 min for up to 50 min; the
+            # concurrency group queues at most one pending run behind it. Even
+            # at one run start per hour this keeps real probe cadence ≈5 min.
+            END=$((SECONDS + 3000))
+            while :; do
+              bash check.sh || true
+              [ $SECONDS -ge $END ] && break
+              sleep 300
+            done
           fi

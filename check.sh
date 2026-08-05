@@ -26,6 +26,11 @@ TARGETS=(
   "Vixy Ads|https://vixy.co.il/api/health|health"
   "Vixy CRM|https://crm.vixy.co.il/health|health"
   "Vixy Coach|https://coach.vixy.co.il/api/health|health"
+  # Real app routes beyond /health: a 5xx / error page on the login route is an
+  # app-level failure that a green /health can miss (5.8 gate, parameter 14).
+  "Vixy Ads login|https://vixy.co.il/login|page"
+  "Vixy CRM login|https://crm.vixy.co.il/login|page"
+  "Vixy Coach login|https://coach.vixy.co.il/login|page"
 )
 
 # --- deploy-drift check -----------------------------------------------------
@@ -185,6 +190,11 @@ if [ "${1:-}" = "selftest" ]; then
 fi
 
 # --- main monitoring loop ---------------------------------------------------
+# The outage label must exist or `gh issue create --label outage` fails and the
+# whole dedup/recovery state machine silently never engages (bit us 5.8: three
+# real alerts went out, zero issues created, no recovery emails).
+gh label create outage --repo "$REPO" --color B60205 --description "product is DOWN (auto-managed by uptime monitor)" >/dev/null 2>&1 || true
+
 FAILED=0
 DEGRADED_LIST=""
 summ "### Uptime check — $(date -u +'%Y-%m-%d %H:%M UTC')\n\n| Product | Status |\n|---|---|"
@@ -202,10 +212,10 @@ for entry in "${TARGETS[@]}"; do
     summ "| $name | ❌ $status |"
     if [ -z "$issue" ]; then
       # new outage -> open issue (state) + alert Guy
-      gh issue create --repo "$REPO" --label outage \
+      issue_err=$(gh issue create --repo "$REPO" --label outage \
         --title "🔴 OUTAGE: $name" \
         --body "$(printf 'Detected DOWN at %s\nURL: %s\nDetail: %s\n\n_auto-managed by the uptime monitor; will close on recovery._' "$ts" "$url" "$status")" \
-        >/dev/null 2>&1 || log "   ⚠️  could not create issue"
+        2>&1 >/dev/null) || log "   ⚠️  could not create issue: $issue_err"
       send_email "🔴 תקלה: $name לא זמין" \
         "<div dir=rtl style='font-family:Arial'><h2 style='color:#c00'>🔴 $name לא מגיב</h2>
          <p><b>זמן:</b> $ts<br><b>כתובת:</b> $url<br><b>פירוט:</b> $status</p>
