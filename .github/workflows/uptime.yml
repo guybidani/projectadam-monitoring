@@ -2,7 +2,11 @@ name: uptime-monitor
 
 on:
   schedule:
-    # every 5 minutes — GitHub may delay under load; this is the min allowed interval
+    # */5 is the minimum GitHub accepts, but it is a REQUEST, not a promise.
+    # Measured 5.8-9.8 (96h, 82 probing runs): the median gap between run STARTS
+    # was 56.8 min, mean 71.8, worst 350 min. GitHub throttles scheduled
+    # workflows hard and there is no way to force it. The real probe cadence
+    # therefore comes from the in-job loop below, not from this cron line.
     - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
@@ -17,15 +21,25 @@ permissions:
 
 concurrency:
   group: uptime-monitor
-  cancel-in-progress: false
+  cancel-in-progress: false   # a live probing loop is never killed by a new tick
+
+env:
+  # How long one job keeps probing every 5 min. This single number IS the
+  # coverage knob. Measured against the real 5.8-9.8 start times:
+  #     50 min ->  65% of wall-clock covered, worst blind window 300 min
+  #    110 min ->  89%,  8 blind windows
+  #    170 min ->  95%,  5 blind windows, worst 180 min   <-- chosen
+  #    230 min ->  98%
+  #    350 min -> 100%  (but a code fix then takes ~6h to reach production)
+  # 170 keeps coverage high while a pushed fix still lands within ~3h.
+  PROBE_WINDOW_MIN: 170
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    # A real multi-product outage needs ~90s per DOWN target (3 probes + waits +
-    # alert + issue). The old 5-min timeout killed the 5.8 outage run mid-flight:
-    # alerts went out but issues/recovery never happened. 58 covers the loop below.
-    timeout-minutes: 58
+    # Must exceed PROBE_WINDOW_MIN plus the last iteration's own runtime.
+    # A real multi-target failure needs ~2 min per DOWN target (retries + waits).
+    timeout-minutes: 178
     steps:
       - uses: actions/checkout@v4
 
@@ -42,11 +56,12 @@ jobs:
           if [ "${{ inputs.selftest }}" = "true" ]; then
             bash check.sh selftest
           else
-            # GitHub throttles */5 schedules hard (measured 5.8: runs started
-            # ~2h apart). So each run probes every ~5 min for up to 50 min; the
-            # concurrency group queues at most one pending run behind it. Even
-            # at one run start per hour this keeps real probe cadence ≈5 min.
-            END=$((SECONDS + 3000))
+            # One job = one long probing window at a true 5-min cadence. Because
+            # the concurrency group is never cancelled in-progress, GitHub parks
+            # one pending run behind this job and starts it the moment this one
+            # ends - so windows butt up against each other instead of leaving
+            # the ~57-min holes the raw cron leaves.
+            END=$(( SECONDS + PROBE_WINDOW_MIN * 60 ))
             while :; do
               bash check.sh || true
               [ $SECONDS -ge $END ] && break
