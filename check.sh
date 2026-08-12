@@ -30,6 +30,11 @@
 #      A SUBSET failing is a real outage and is always alerted.
 #      All targets failing with *app*-class codes (5xx/degraded - transport
 #      worked) is NOT suppressed: that is a real full-stack failure.
+#      SECOND VANTAGE (added 12.8): a genuinely dead origin looks EXACTLY like a
+#      blackhole from here - all 7 on one IP, every probe times out, canary UP.
+#      So before suppressing, ask the Cloudflare Worker (independent network). If
+#      it also sees the products down, the gate is overridden and we alert. Blind
+#      is silent, and silence must never be the answer to a real outage.
 #   2. ONE GROUPED EMAIL PER RUN. Never one per target. Seven mails about one
 #      event are seven reasons to delete unread. The subject says how many and who.
 #   3. Transport (HTTP 000) and app (5xx / degraded / error page) are different
@@ -48,6 +53,7 @@
 #   ALERT_TO              recipient (drills point this at a test mailbox)
 #   RETRIES / RETRY_WAIT / TRANSPORT_RETRIES / TRANSPORT_RETRY_WAIT
 #   EGRESS_CANARIES       space-separated URLs used to prove the runner has network
+#   WORKER_STATUS_URL     second-vantage endpoint (empty string disables the check)
 #   MONITOR_BLIND_NOTIFY=1  also email (a distinctly-worded, non-outage) notice
 #                           when the runner is blind; off by default on purpose
 set -uo pipefail
@@ -217,6 +223,52 @@ canary_up() {
   done
   CANARY_HIT="none of: $EGRESS_CANARIES"
   return 1
+}
+
+# --- independent SECOND VANTAGE: the Cloudflare Worker ---------------------
+# The gap the correlation gate leaves open (found 12.8 by drill): a real total
+# outage of the origin and a runner-side blackhole produce the IDENTICAL
+# signature here - every target transport-class HTTP 000, egress canary UP. All
+# 7 targets sit on one IP (72.62.89.64), so if that host or Hostinger's edge
+# dies, every probe times out exactly like a blackhole and the gate suppresses
+# it. Blind is silent by design, so a total outage would be SILENT in this
+# monitor. Asking the Worker converts "no information" into information: it
+# probes the same three products from Cloudflare's network - a vantage sharing
+# fate with neither this runner nor the VPS.
+#   products-down -> real outage: alert even though everything looks blind
+#   products-ok   -> runner-side blindness confirmed: suppress (unchanged)
+#   unavailable   -> no new information: suppress (unchanged)
+# Can only ever ADD an alert where the monitor is silent today; it never
+# suppresses anything that alerts today.
+WORKER_STATUS_URL="${WORKER_STATUS_URL:-https://vixy-worker-monitor.vixy-infra.workers.dev/status}"
+SECOND_OPINION="not-checked"; SECOND_OPINION_DETAIL=""
+second_opinion() {
+  local body rc parsed
+  if [ -z "$WORKER_STATUS_URL" ]; then
+    SECOND_OPINION="unavailable"; SECOND_OPINION_DETAIL="no worker URL configured"; return
+  fi
+  body=$(curl -sS --max-time 25 "$WORKER_STATUS_URL" 2>/dev/null); rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$body" ]; then
+    SECOND_OPINION="unavailable"; SECOND_OPINION_DETAIL="worker unreachable (curl exit $rc)"; return
+  fi
+  parsed=$(BODY="$body" python3 -c '
+import json, os, sys
+try:
+    live = json.loads(os.environ["BODY"]).get("live")
+except Exception:
+    print("unavailable|worker answered unparseable JSON"); sys.exit()
+if not isinstance(live, list) or not live:
+    print("unavailable|worker answered without a live[] array"); sys.exit()
+bad = [t.get("name", "?") for t in live if t.get("ok") is not True]
+if bad:
+    print("products-down|worker also sees DOWN: " + ", ".join(bad))
+else:
+    print("products-ok|worker sees all %d products UP from Cloudflare" % len(live))
+' 2>/dev/null)
+  if [ -z "$parsed" ]; then
+    SECOND_OPINION="unavailable"; SECOND_OPINION_DETAIL="could not parse worker answer"; return
+  fi
+  SECOND_OPINION="${parsed%%|*}"; SECOND_OPINION_DETAIL="${parsed#*|}"
 }
 
 # --- open outage issues: fetched ONCE per run, matched locally -------------
@@ -401,10 +453,24 @@ if [ "$n_failed" -gt 0 ]; then
     GATE_REASON="${GATE_REASON:+$GATE_REASON; }egress canary unreachable ($CANARY_HIT) - HTTP 000 says nothing about our products"
   fi
 fi
+# Before trusting the gate, get the independent second vantage. Blind is silent,
+# and silence must never be the answer to a real outage that merely LOOKS blind.
+if [ "$BLIND_ALL" = "1" ] || [ "$SUPPRESS_TRANSPORT" = "1" ]; then
+  second_opinion
+  log "second vantage (worker): $SECOND_OPINION - $SECOND_OPINION_DETAIL"
+  if [ "$SECOND_OPINION" = "products-down" ]; then
+    BLIND_ALL=0; SUPPRESS_TRANSPORT=0
+    GATE_REASON=""
+    log ""
+    log "🔴 GATE OVERRIDDEN by the second vantage: $SECOND_OPINION_DETAIL"
+    log "   -> this is a real outage that only looked like runner blindness; alerting"
+  fi
+fi
 if [ -n "$GATE_REASON" ]; then
   log ""
   log "🌐 CORRELATION GATE: $GATE_REASON"
   log "   -> no outage issue, no outage email for the suppressed targets"
+  log "   (second vantage: $SECOND_OPINION - $SECOND_OPINION_DETAIL)"
 fi
 
 summ "### Uptime check - $RUN_TS\n\n| Target | Class | Status |\n|---|---|---|"
@@ -444,8 +510,8 @@ while [ "$i" -lt "$n_total" ]; do
     if [ "$MONITOR_DRY_RUN" != "1" ]; then
       issue_err=$(gh issue create --repo "$REPO" --label outage \
         --title "🔴 OUTAGE: $name" \
-        --body "$(printf 'Detected DOWN at %s\nURL: %s\nClass: %s\nDetail: %s\nEgress canary: %s (%s)\n\n_auto-managed by the uptime monitor; will close on recovery._' \
-                  "$RUN_TS" "$url" "$class" "$detail" "$EGRESS" "$CANARY_HIT")" \
+        --body "$(printf 'Detected DOWN at %s\nURL: %s\nClass: %s\nDetail: %s\nEgress canary: %s (%s)\nSecond vantage (Cloudflare Worker): %s - %s\n\n_auto-managed by the uptime monitor; will close on recovery._' \
+                  "$RUN_TS" "$url" "$class" "$detail" "$EGRESS" "$CANARY_HIT" "$SECOND_OPINION" "$SECOND_OPINION_DETAIL")" \
         2>&1 >/dev/null) || log "   ⚠️  could not create issue: $issue_err"
     fi
     DOWN_NEW+=("$i|$name")
@@ -457,8 +523,8 @@ done
 
 if [ "${#SUPPRESSED[@]}" -gt 0 ]; then
   record_blind "$RUN_TS" "$GATE_REASON" \
-    "$(printf 'Targets with no measurement: %s\nSample failure: %s\nRunner egress IP: %s\nEgress canary: %s (%s)\nRun: %s' \
-       "${SUPPRESSED[*]}" "${T_DETAIL[0]}" "$(runner_ip)" "$EGRESS" "$CANARY_HIT" "${GITHUB_RUN_ID:-local}")"
+    "$(printf 'Targets with no measurement: %s\nSample failure: %s\nRunner egress IP: %s\nEgress canary: %s (%s)\nSecond vantage (Cloudflare Worker): %s - %s\nRun: %s' \
+       "${SUPPRESSED[*]}" "${T_DETAIL[0]}" "$(runner_ip)" "$EGRESS" "$CANARY_HIT" "$SECOND_OPINION" "$SECOND_OPINION_DETAIL" "${GITHUB_RUN_ID:-local}")"
 fi
 
 # ---- ONE grouped outage email --------------------------------------------

@@ -98,7 +98,23 @@ gate:
    canary** - three unrelated hosts. If none of them answers, the runner has no
    network and an `HTTP 000` says nothing about our products, so transport
    failures are suppressed. App-class failures still alert even then.
-3. **One grouped email per run, never one per target.** Seven mails about one
+3. **Second vantage before any suppression** (added 12.8, found by drill). A
+   genuinely dead origin looks **identical** to a blackhole from here: all seven
+   targets sit on one IP (`72.62.89.64`), so if that host or Hostinger's edge
+   dies, every probe times out with `HTTP 000` and the canary still answers -
+   exactly the blind signature. Blind is silent by design, so rule 1 alone would
+   make a **total outage silent**. Before suppressing, the run asks the
+   Cloudflare Worker (`/status`), which probes the same products from a network
+   sharing fate with neither this runner nor the VPS:
+   | Worker says | Action |
+   |---|---|
+   | products **down** | gate **overridden** - alert (this was silent before) |
+   | products **ok** | runner-side blindness confirmed - suppress |
+   | unreachable | no new information - suppress (unchanged) |
+   It can only ever **add** an alert where the monitor is silent today; it never
+   suppresses anything that alerts today. Override with `WORKER_STATUS_URL`
+   (empty string disables it).
+4. **One grouped email per run, never one per target.** Seven mails about one
    event are seven reasons to delete unread. The subject carries the blast radius:
    `🔴 תקלה (3/7): Vixy CRM, Vixy CRM login, Vixy Coach` - how many, and who.
    Recovery is grouped the same way: `✅ חזרו לפעול (2): …`.
@@ -155,7 +171,8 @@ The four cases that must keep holding:
 
 | drill | expected |
 |---|---|
-| 7/7 targets `HTTP 000` | **no** issue, **no** mail, one `monitor-blind` entry |
+| 7/7 targets `HTTP 000`, Worker sees products UP | **no** issue, **no** mail, one `monitor-blind` entry |
+| 7/7 targets `HTTP 000`, Worker sees products DOWN | gate overridden - **grouped mail** |
 | subset fails, canary UP | **one** grouped mail naming them |
 | 7/7 fail with 404/5xx | alert **is** sent (transport worked) |
 | canary DOWN + mixed | transport suppressed, app-class **still** alerts |
