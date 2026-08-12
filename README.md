@@ -1,9 +1,45 @@
-# Vixy - External Uptime Monitor
+# Vixy - External Uptime Monitor (BACKUP source)
 
-External (off-VPS) uptime monitoring for the live production products.
-Runs on **GitHub Actions** so it keeps watching even when the VPS itself is down.
-That is also why it stays on GitHub: a monitor hosted on the server it watches
-reports nothing at the only moment that matters.
+External (off-VPS) uptime monitoring for the live production products, running
+on **GitHub Actions**. **Since 2026-08-12 this is the BACKUP source, hourly.**
+The primary is the Cloudflare Worker `vixy-worker-monitor` (true 5-min cron,
+JSON-field checks, alerts to `support@vixy.co.il`; code in the vixy repo under
+`infra/uptime-worker/`). This repo stays alive because it is the one vantage
+that shares fate with **neither** the VPS **nor** Cloudflare, and because it
+carries the deploy-drift check.
+
+## The monitoring stack (who watches what)
+
+| # | Source | Cadence | Vantage / blind spot | Alerts to |
+|---|---|---|---|---|
+| 1 - primary | Cloudflare Worker `vixy-worker-monitor` | every 5 min (real) | dies only with Cloudflare | `support@vixy.co.il` |
+| 2 - on-host | VPS cron `vixy-health-monitor.sh` | every 5 min | dies with the VPS | Guy's gmail |
+| 3 - backup | this repo (GitHub Actions) | hourly (`7 * * * *`) | dies with GitHub; some runner subnets are blackholed toward Hostinger (below) | `ALERT_TO` secret |
+
+## Root cause of the HTTP 000 noise - diagnosed 2026-08-12
+
+All seven targets resolve to **one origin IP** (`72.62.89.64`, Hostinger; plain
+A records - no Cloudflare proxy, no AAAA). The false episodes were a **TCP
+blackhole between some GitHub runner subnets and Hostinger's edge**:
+
+- Every failed curl burned its **full 20 s `--max-time`** - probe spacing in the
+  logs is exactly 180 s = 5 x 20 s timeouts + 4 x 20 s waits. SYNs silently
+  dropped. Not DNS (fails fast; the zone is on Cloudflare DNS), not
+  connection-refused (instant), not TLS (seconds).
+- The **egress canary was UP in every blind record** (`google.com -> 204`) - the
+  runner had internet, just not a path to that one IP.
+- The VPS is clean: `ufw` inactive, `INPUT` policy ACCEPT, no fail2ban/crowdsec,
+  conntrack 34/262144 - the drop is **upstream of the VPS**.
+- Entire runs were blind start-to-finish (run `31453538743`: 02:49-05:55 UTC,
+  every probe 000) while adjacent runs on other runners saw everything UP, and
+  a home connection got `200` throughout - **vantage-specific**, i.e. specific
+  runner subnets.
+
+Timeouts, retries and IPv4-forcing cannot fix a path that is dead for hours
+from that vantage. The fix is structural: the Worker (a vantage that works) is
+primary, this monitor is an hourly backup behind the correlation gate, and
+every future transport failure now self-documents (curl exit code + message +
+runner egress IP in the `monitor-blind` log).
 
 ## What it watches - 7 targets
 
@@ -23,39 +59,16 @@ Customers are on `vixy.co.il` since the 29.7 rebrand; the old
 The `/login` routes are watched because a green `/health` can sit in front of an
 app route that 5xxs.
 
-## How often it really runs - measured, not claimed
+## Cadence - hourly backup, single pass
 
-The cron line says `*/5`. **GitHub does not honour it**, and it cannot be forced.
-Measured over the 96 h to 2026-08-09 20:13 UTC (82 probing runs):
-
-| | measured |
-|---|---|
-| median gap between scheduled run **starts** | **56.8 min** (mean 71.8, worst 350) |
-| wall-clock **coverage** before the fix (50-min probing window) | **71.6 %** |
-| blind windows in those 96 h | **31** - median 31 min, p90 116 min, worst **5.6 h** |
-
-So the honest claim is **not** "every 5 minutes". What is true: *while a job is
-running* it probes every 5 minutes; the gaps are GitHub's scheduler.
-
-The fix is the in-job probing window (`PROBE_WINDOW_MIN`, currently **170 min**):
-one job keeps probing on a 5-min loop for ~3 h, and because the concurrency group
-is never cancelled in-progress, GitHub parks the next run behind it and starts it
-the moment this one ends. Replaying the same real start times:
-
-| probing window | wall-clock coverage | blind windows | worst |
-|---|---|---|---|
-| 50 min (old) | 65 % | 56 | 300 min |
-| 110 min | 89 % | 8 | 240 min |
-| **170 min (now)** | **95 %** | **5** | 180 min |
-| 230 min | 98 % | 2 | 120 min |
-| 350 min | 100 % | 0 | - |
-
-170 was chosen over 350 because a pushed fix only reaches production when the
-running job ends - 350 would mean a ~6 h lag on every change.
-
-**Full coverage needs a second, independent source** (an off-GitHub prober).
-That requires opening an account, which is Guy's call - see the recommendation
-at the bottom.
+The cron is `7 * * * *` - one probing pass per hour. History for context: at
+`*/5` GitHub throttled the schedule to a measured median gap of **56.8 min**
+between run starts (96 h to 2026-08-09, 82 runs), which this repo once
+compensated for with a 170-min in-job probe loop. That loop is gone: it pinned
+a single runner for ~3 h, so one blackholed runner (see root cause above)
+meant ~3 h of `HTTP 000` noise per episode. As a backup behind a true-5-min
+primary, an hourly single pass from a fresh runner each time is strictly
+better: coverage comes from the Worker, independence comes from here.
 
 ## Correlation gate - why alerts are trustworthy again
 
@@ -159,9 +172,9 @@ private ones. This repo holds **no secrets** (only public domain names + health
 paths; the API key lives in encrypted Actions Secrets), so public is safe and
 free. Product repos stay private.
 
-## Open recommendation - the second source
+## The "second source" recommendation - CLOSED 2026-08-11/12
 
-Coverage is capped at ~95 % because everything here depends on one scheduler on
-one network. A second independent prober would both close the remaining gap and
-turn the egress canary into a real cross-check. It needs an account, so it is
-Guy's decision, not the fleet's - see the handover note.
+The independent off-GitHub prober this section used to ask for exists: the
+Cloudflare Worker `vixy-worker-monitor` (deployed 11.8, negative-control
+verified to the monitored inbox). On 12.8 it was made the **primary** and this
+repo became the hourly backup - see the stack table at the top.

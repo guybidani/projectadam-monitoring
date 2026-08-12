@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
-# Vixy - external uptime monitor.
+# Vixy - external uptime monitor. BACKUP source since 2026-08-12.
 # Runs from GitHub Actions (off-VPS), so it stays up even when the VPS is down.
+# The PRIMARY uptime source is the Cloudflare Worker `vixy-worker-monitor`
+# (true 5-min cron, JSON-field checks, alerts to support@vixy.co.il). This
+# workflow is the independent second vantage (shares fate with neither the VPS
+# nor Cloudflare) and carries the deploy-drift check.
+#
+# ROOT CAUSE of the HTTP 000 noise (diagnosed 2026-08-12): a TCP blackhole
+# between some GitHub runner subnets and Hostinger's edge (72.62.89.64 - the
+# single origin IP behind ALL targets: A records only, no Cloudflare proxy,
+# no AAAA). Every failed curl burned its full 20s --max-time (probe spacing
+# exactly 180s = 5x20s timeout + 4x20s wait), i.e. SYNs silently dropped -
+# not DNS (fails fast; the zone is on Cloudflare DNS), not refused (instant),
+# not TLS (seconds). Not the VPS either: INPUT policy ACCEPT, no
+# fail2ban/crowdsec, ufw inactive, conntrack 34/262144. Entire runs are blind
+# start-to-finish (run 31453538743: 02:49-05:55 UTC, every probe 000, canary
+# UP) while adjacent runs see all UP - the drop is upstream of the VPS and
+# vantage-specific. Unfixable from our side; hence backup role + the gate.
 #
 # Alerting rules (see README "Correlation gate" - do not soften these):
 #   1. CORRELATION GATE. If *every* target fails in the same run and every one of
@@ -145,12 +161,19 @@ print(json.dumps({"from":os.environ["MFROM"],"to":[os.environ["MTO"]],"subject":
 #               JSON, error page) -> transport worked, this is a real signal
 PROBE_CLASS="up"; PROBE_DETAIL="UP"
 probe() {
-  local url="$1" type="$2" code
-  code=$(curl -sS -o "$BODY_FILE" -w "%{http_code}" --max-time 20 "$url" 2>/dev/null)
+  local url="$1" type="$2" code rc curl_err
+  curl_err="$(mktemp)"
+  code=$(curl -sS -o "$BODY_FILE" -w "%{http_code}" --max-time 20 "$url" 2>"$curl_err"); rc=$?
   code="${code:-000}"
   if [ "$code" = "000" ]; then
-    PROBE_CLASS="transport"; PROBE_DETAIL="HTTP 000 (no response - DNS/connect/TLS/timeout)"; return 1
+    # Name the transport failure precisely: curl's exit code + message
+    # (6=DNS, 7=refused, 28=timeout, 35=TLS). A bare "HTTP 000" hid the root
+    # cause for a week - never discard this again (12.8 diagnosis).
+    PROBE_CLASS="transport"
+    PROBE_DETAIL="HTTP 000 (curl exit $rc: $(tr -d '\n' < "$curl_err" | head -c 160))"
+    rm -f "$curl_err"; return 1
   fi
+  rm -f "$curl_err"
   if [ "$code" != "200" ]; then
     PROBE_CLASS="app"; PROBE_DETAIL="HTTP $code"; return 1
   fi
@@ -208,6 +231,18 @@ load_open_outages() {
 find_issue() {
   [ -z "$OPEN_OUTAGES" ] && return 0
   printf '%s\n' "$OPEN_OUTAGES" | awk -F'\t' -v t="🔴 OUTAGE: $1" '$2==t {print $1; exit}'
+}
+
+# --- runner egress IP (fetched once, only on failure paths) ----------------
+# Lets blind episodes be correlated by runner subnet across occurrences - the
+# 12.8 diagnosis showed the blackhole is vantage-specific.
+RUNNER_EGRESS_IP=""
+runner_ip() {
+  if [ -z "$RUNNER_EGRESS_IP" ]; then
+    RUNNER_EGRESS_IP=$(curl -sS --max-time 10 https://api.ipify.org 2>/dev/null || true)
+    RUNNER_EGRESS_IP="${RUNNER_EGRESS_IP:-unknown}"
+  fi
+  printf '%s' "$RUNNER_EGRESS_IP"
 }
 
 # --- record a blind run (no product alert, no email by default) ------------
@@ -422,8 +457,8 @@ done
 
 if [ "${#SUPPRESSED[@]}" -gt 0 ]; then
   record_blind "$RUN_TS" "$GATE_REASON" \
-    "$(printf 'Targets with no measurement: %s\nEgress canary: %s (%s)\nRun: %s' \
-       "${SUPPRESSED[*]}" "$EGRESS" "$CANARY_HIT" "${GITHUB_RUN_ID:-local}")"
+    "$(printf 'Targets with no measurement: %s\nSample failure: %s\nRunner egress IP: %s\nEgress canary: %s (%s)\nRun: %s' \
+       "${SUPPRESSED[*]}" "${T_DETAIL[0]}" "$(runner_ip)" "$EGRESS" "$CANARY_HIT" "${GITHUB_RUN_ID:-local}")"
 fi
 
 # ---- ONE grouped outage email --------------------------------------------

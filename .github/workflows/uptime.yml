@@ -2,12 +2,22 @@ name: uptime-monitor
 
 on:
   schedule:
-    # */5 is the minimum GitHub accepts, but it is a REQUEST, not a promise.
-    # Measured 5.8-9.8 (96h, 82 probing runs): the median gap between run STARTS
-    # was 56.8 min, mean 71.8, worst 350 min. GitHub throttles scheduled
-    # workflows hard and there is no way to force it. The real probe cadence
-    # therefore comes from the in-job loop below, not from this cron line.
-    - cron: '*/5 * * * *'
+    # BACKUP cadence since 2026-08-12. The PRIMARY uptime source is the
+    # Cloudflare Worker `vixy-worker-monitor` (true 5-min cron, JSON-field
+    # checks, alerts to support@vixy.co.il, verified end-to-end 11.8). This
+    # workflow is the independent second vantage - it shares fate with neither
+    # the VPS nor Cloudflare - and it carries the deploy-drift check.
+    #
+    # Why hourly and not */5: (a) a backup does not need 5-min cadence;
+    # (b) GitHub throttles schedule crons anyway (measured 5.8-9.8: median gap
+    # between run starts 56.8 min at */5); (c) the 170-min in-job probe loop
+    # that compensated for the throttling is exactly what amplified the false
+    # HTTP 000 noise - one blackholed runner stayed blind for a whole ~3 h
+    # window (see check.sh header: root cause diagnosed 12.8, a TCP blackhole
+    # between some GitHub runner subnets and Hostinger's edge, upstream of the
+    # VPS, unfixable from our side).
+    # Minute 7, not 0: the top of the hour is the scheduler's busiest slot.
+    - cron: '7 * * * *'
   workflow_dispatch:
     inputs:
       selftest:
@@ -21,25 +31,14 @@ permissions:
 
 concurrency:
   group: uptime-monitor
-  cancel-in-progress: false   # a live probing loop is never killed by a new tick
-
-env:
-  # How long one job keeps probing every 5 min. This single number IS the
-  # coverage knob. Measured against the real 5.8-9.8 start times:
-  #     50 min ->  65% of wall-clock covered, worst blind window 300 min
-  #    110 min ->  89%,  8 blind windows
-  #    170 min ->  95%,  5 blind windows, worst 180 min   <-- chosen
-  #    230 min ->  98%
-  #    350 min -> 100%  (but a code fix then takes ~6h to reach production)
-  # 170 keeps coverage high while a pushed fix still lands within ~3h.
-  PROBE_WINDOW_MIN: 170
+  cancel-in-progress: false
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    # Must exceed PROBE_WINDOW_MIN plus the last iteration's own runtime.
-    # A real multi-target failure needs ~2 min per DOWN target (retries + waits).
-    timeout-minutes: 178
+    # Single pass. Worst case is all 7 targets transport-failing:
+    # 7 x (5 retries x 20 s timeout + 4 x 20 s wait) = 21 min, plus overhead.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -56,15 +55,5 @@ jobs:
           if [ "${{ inputs.selftest }}" = "true" ]; then
             bash check.sh selftest
           else
-            # One job = one long probing window at a true 5-min cadence. Because
-            # the concurrency group is never cancelled in-progress, GitHub parks
-            # one pending run behind this job and starts it the moment this one
-            # ends - so windows butt up against each other instead of leaving
-            # the ~57-min holes the raw cron leaves.
-            END=$(( SECONDS + PROBE_WINDOW_MIN * 60 ))
-            while :; do
-              bash check.sh || true
-              [ $SECONDS -ge $END ] && break
-              sleep 300
-            done
+            bash check.sh
           fi
