@@ -184,8 +184,14 @@ probe() {
     PROBE_CLASS="app"; PROBE_DETAIL="HTTP $code"; return 1
   fi
   if [ "$type" = "health" ]; then
-    # any JSON field explicitly reporting a failure state = degraded
-    if grep -qiE '"[a-z_]+"[[:space:]]*:[[:space:]]*"(down|error|fail|failed|unhealthy|degraded)"' "$BODY_FILE"; then
+    # any JSON field explicitly reporting a failure state = degraded.
+    # EXCEPT config-state fields: `phoneWall` reports whether the signup phone
+    # wall is ARMED (a hand-set product decision, Guy 2026-09-02 - absent means
+    # down BY DESIGN), not whether something broke. Coach serves it as the
+    # string "down", which this grep read as an outage (false alarm #76).
+    # Strip it before classifying; a real failure still has its own field.
+    if sed -E 's/"phoneWall"[[:space:]]*:[[:space:]]*"[a-z]+"//Ig' "$BODY_FILE" \
+       | grep -qiE '"[a-z_]+"[[:space:]]*:[[:space:]]*"(down|error|fail|failed|unhealthy|degraded)"'; then
       PROBE_CLASS="app"; PROBE_DETAIL="degraded $(tr -d '\n' < "$BODY_FILE" | head -c 160)"; return 1
     fi
   else
